@@ -6,6 +6,9 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
+import hashlib
+import hmac
+import secrets
 
 import pandas as pd
 import psycopg
@@ -38,22 +41,29 @@ def get_conn() -> psycopg.Connection:
         raise exc
 
 
+def _normalize_params(params: tuple | list | None = ()) -> tuple:
+    if params is None:
+        return ()
+    if isinstance(params, tuple):
+        return params
+    if isinstance(params, list):
+        return tuple(params)
+    return (params,)
+
+
 def execute(sql: str, params: tuple = ()) -> None:
+    params = _normalize_params(params)
     with closing(get_conn()) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
         conn.commit()
-    query_df_cached.clear()
-    query_one_cached.clear()
-    build_project_report_pdf.clear()
-    build_vendor_report_pdf.clear()
-    build_vendor_report_excel.clear()
-    build_vendor_master_pdf.clear()
-    build_vendor_master_excel.clear()
+    cached_query_df.clear()
+    cached_query_one.clear()
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def query_df_cached(sql: str, params: tuple = ()) -> pd.DataFrame:
+def cached_query_df(sql: str, params: tuple = ()) -> pd.DataFrame:
+    params = _normalize_params(params)
     with closing(get_conn()) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
@@ -65,11 +75,12 @@ def query_df_cached(sql: str, params: tuple = ()) -> pd.DataFrame:
 
 
 def query_df(sql: str, params: tuple = ()) -> pd.DataFrame:
-    return query_df_cached(sql, params)
+    return cached_query_df(sql, _normalize_params(params)).copy()
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def query_one_cached(sql: str, params: tuple = ()) -> Optional[dict[str, Any]]:
+def cached_query_one(sql: str, params: tuple = ()) -> Optional[dict[str, Any]]:
+    params = _normalize_params(params)
     with closing(get_conn()) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
@@ -77,10 +88,15 @@ def query_one_cached(sql: str, params: tuple = ()) -> Optional[dict[str, Any]]:
 
 
 def query_one(sql: str, params: tuple = ()) -> Optional[dict[str, Any]]:
-    return query_one_cached(sql, params)
+    return cached_query_one(sql, _normalize_params(params))
 
 
 @st.cache_resource(show_spinner=False)
+def bootstrap_db() -> bool:
+    bootstrap_db()
+    return True
+
+
 def init_db() -> None:
     ddl = """
     CREATE TABLE IF NOT EXISTS company_categories (
@@ -110,6 +126,16 @@ def init_db() -> None:
         active INTEGER DEFAULT 1,
         sort_order INTEGER,
         notes TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        username TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL,
+        active INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS materials (
@@ -301,6 +327,174 @@ def sort_vendor_df_numeric(df: pd.DataFrame, item_col: str) -> pd.DataFrame:
     return out
 
 
+
+PBKDF2_ITERATIONS = 200_000
+ROLE_OPTIONS = ["Owner", "Materials Manager", "Contractor", "Other"]
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), PBKDF2_ITERATIONS)
+    return f"{salt}${digest.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        salt, expected = stored_hash.split("$", 1)
+    except ValueError:
+        return False
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), PBKDF2_ITERATIONS).hex()
+    return hmac.compare_digest(digest, expected)
+
+
+def count_users() -> int:
+    row = query_one("SELECT COUNT(*) AS c FROM users")
+    return int(row["c"] if row else 0)
+
+
+def get_user_by_username(username: str) -> Optional[dict[str, Any]]:
+    return query_one("SELECT * FROM users WHERE LOWER(username) = LOWER(%s)", (username.strip(),))
+
+
+def ensure_session_defaults() -> None:
+    st.session_state.setdefault("logged_in", False)
+    st.session_state.setdefault("user", None)
+
+
+def logout() -> None:
+    st.session_state["logged_in"] = False
+    st.session_state["user"] = None
+    st.rerun()
+
+
+def show_bootstrap_owner() -> None:
+    st.title("Materials Management V2")
+    st.subheader("Create Owner Account")
+    st.info("No users exist yet. Create the first Owner account to start using the system.")
+    with st.form("bootstrap_owner_form"):
+        username = st.text_input("Owner username")
+        password = st.text_input("Password", type="password")
+        confirm = st.text_input("Confirm password", type="password")
+        submitted = st.form_submit_button("Create Owner")
+        if submitted:
+            if not username.strip() or not password:
+                st.error("Username and password are required.")
+            elif password != confirm:
+                st.error("Passwords do not match.")
+            else:
+                execute(
+                    "INSERT INTO users (username, password_hash, role, active, updated_at) VALUES (%s, %s, %s, %s, %s)",
+                    (username.strip(), hash_password(password), "Owner", 1, now_ts()),
+                )
+                st.success("Owner account created. Please log in.")
+                st.rerun()
+
+
+def show_login() -> None:
+    st.title("Materials Management V2")
+    st.subheader("Login")
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Log in")
+        if submitted:
+            user = get_user_by_username(username)
+            if not user:
+                st.error("Invalid username or password.")
+            elif int(user.get("active", 0)) != 1:
+                st.error("This user is inactive.")
+            elif not verify_password(password, user["password_hash"]):
+                st.error("Invalid username or password.")
+            else:
+                st.session_state["logged_in"] = True
+                st.session_state["user"] = dict(user)
+                st.rerun()
+
+
+def require_login() -> bool:
+    ensure_session_defaults()
+    if count_users() == 0:
+        show_bootstrap_owner()
+        return False
+    if not st.session_state.get("logged_in") or not st.session_state.get("user"):
+        show_login()
+        return False
+    current = get_user_by_username(st.session_state["user"]["username"])
+    if not current or int(current.get("active", 0)) != 1:
+        logout()
+        return False
+    st.session_state["user"] = dict(current)
+    return True
+
+
+def can_manage_users() -> bool:
+    user = st.session_state.get("user") or {}
+    return user.get("role") == "Owner"
+
+
+def page_admin() -> None:
+    st.header("Admin")
+    if not can_manage_users():
+        st.warning("Only the Owner can access this page.")
+        return
+
+    tab1, tab2 = st.tabs(["Create User", "Manage Users"])
+
+    with tab1:
+        with st.form("create_user_form"):
+            c1, c2 = st.columns(2)
+            username = c1.text_input("Username")
+            role = c2.selectbox("User type", ROLE_OPTIONS)
+            password = st.text_input("Password", type="password")
+            confirm = st.text_input("Confirm password", type="password")
+            active = st.checkbox("Active", value=True)
+            submitted = st.form_submit_button("Create User")
+            if submitted:
+                existing = get_user_by_username(username)
+                if not username.strip() or not password:
+                    st.error("Username and password are required.")
+                elif existing:
+                    st.error("That username already exists.")
+                elif password != confirm:
+                    st.error("Passwords do not match.")
+                else:
+                    execute(
+                        "INSERT INTO users (username, password_hash, role, active, updated_at) VALUES (%s, %s, %s, %s, %s)",
+                        (username.strip(), hash_password(password), role, 1 if active else 0, now_ts()),
+                    )
+                    st.success("User created.")
+                    st.rerun()
+
+    with tab2:
+        users_df = query_df("SELECT user_id, username, role, active, created_at, updated_at FROM users ORDER BY username")
+        users_df = format_dates(users_df)
+        st.dataframe(users_df, use_container_width=True)
+        if not users_df.empty:
+            options = {f"{row['username']} | {row['role']}": int(row['user_id']) for _, row in users_df.iterrows()}
+            selected = st.selectbox("Select user", list(options.keys()))
+            user_row = query_one("SELECT * FROM users WHERE user_id = %s", (options[selected],))
+            with st.form("manage_user_form"):
+                c1, c2 = st.columns(2)
+                role = c1.selectbox("User type", ROLE_OPTIONS, index=ROLE_OPTIONS.index(user_row['role']) if user_row['role'] in ROLE_OPTIONS else 0)
+                active = c2.checkbox("Active", value=bool(user_row['active']))
+                new_password = st.text_input("New password (leave blank to keep current)", type="password")
+                save = st.form_submit_button("Save User Changes")
+                if save:
+                    if new_password:
+                        execute(
+                            "UPDATE users SET role = %s, active = %s, password_hash = %s, updated_at = %s WHERE user_id = %s",
+                            (role, 1 if active else 0, hash_password(new_password), now_ts(), user_row['user_id']),
+                        )
+                    else:
+                        execute(
+                            "UPDATE users SET role = %s, active = %s, updated_at = %s WHERE user_id = %s",
+                            (role, 1 if active else 0, now_ts(), user_row['user_id']),
+                        )
+                    st.success("User updated.")
+                    if st.session_state.get('user', {}).get('user_id') == user_row['user_id']:
+                        st.session_state['user'] = dict(query_one("SELECT * FROM users WHERE user_id = %s", (user_row['user_id'],)))
+                    st.rerun()
+
 def add_material_line_from_master(
     work_item_id: int,
     material_id: int,
@@ -369,7 +563,6 @@ def add_material_line_from_master(
 # Report builders
 # -----------------------------
 
-@st.cache_data(show_spinner=False)
 def build_project_report_pdf(project_id: int) -> BytesIO:
     project = query_one("SELECT * FROM projects WHERE project_id = %s", (project_id,))
     if project is None:
@@ -469,7 +662,6 @@ def _vendor_project_df(project_id: int) -> pd.DataFrame:
     return sort_vendor_df_numeric(df, "item_number")
 
 
-@st.cache_data(show_spinner=False)
 def build_vendor_report_pdf(project_id: int) -> BytesIO:
     project = query_one("SELECT * FROM projects WHERE project_id = %s", (project_id,))
     if project is None:
@@ -513,7 +705,6 @@ def build_vendor_report_pdf(project_id: int) -> BytesIO:
     return buffer
 
 
-@st.cache_data(show_spinner=False)
 def build_vendor_report_excel(project_id: int) -> BytesIO:
     df = _vendor_project_df(project_id).rename(
         columns={
@@ -562,7 +753,6 @@ def _vendor_master_df(selected_vendor: str) -> pd.DataFrame:
     return sort_vendor_df_numeric(df, "item_number")
 
 
-@st.cache_data(show_spinner=False)
 def build_vendor_master_pdf(selected_vendor: str) -> BytesIO:
     rows = _vendor_master_df(selected_vendor)
     buffer = BytesIO()
@@ -596,7 +786,6 @@ def build_vendor_master_pdf(selected_vendor: str) -> BytesIO:
     return buffer
 
 
-@st.cache_data(show_spinner=False)
 def build_vendor_master_excel(selected_vendor: str) -> BytesIO:
     df = _vendor_master_df(selected_vendor).rename(
         columns={
@@ -654,65 +843,140 @@ def page_dashboard() -> None:
     st.dataframe(df_proj, use_container_width=True)
 
 
-def page_setup() -> None:
-    st.header("Setup")
+def page_categories() -> None:
+    st.header("Categories")
     tab1, tab2, tab3 = st.tabs(["Categories", "Sub-categories", "Units"])
 
     with tab1:
-        with st.form("add_category_form"):
-            col1, col2 = st.columns([3, 1])
-            category_name = col1.text_input("Category name")
-            sort_order = col2.number_input("Sort order", min_value=0, step=1, value=0)
-            notes = st.text_area("Notes")
-            submitted = st.form_submit_button("Add category")
-            if submitted and category_name.strip():
-                try:
-                    execute(
-                        "INSERT INTO company_categories (category_name, sort_order, notes) VALUES (%s, %s, %s)",
-                        (category_name.strip(), sort_order, notes.strip()),
-                    )
-                    st.success("Category added.")
-                except Exception as exc:
-                    st.error(f"Could not add category: {exc}")
-
-        st.dataframe(query_df("SELECT * FROM company_categories ORDER BY category_name"), use_container_width=True)
+        left, right = st.columns([1, 1])
+        with left:
+            with st.form("add_category_form"):
+                category_name = st.text_input("Category name")
+                sort_order = st.number_input("Sort order", min_value=0, step=1, value=0)
+                notes = st.text_area("Notes")
+                submitted = st.form_submit_button("Add Category")
+                if submitted:
+                    if not category_name.strip():
+                        st.error("Category name is required.")
+                    else:
+                        try:
+                            execute(
+                                "INSERT INTO company_categories (category_name, sort_order, notes) VALUES (%s, %s, %s)",
+                                (category_name.strip(), sort_order, notes.strip()),
+                            )
+                            st.success("Category added.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not add category: {exc}")
+        with right:
+            cats_df = query_df("SELECT category_id, category_name, active, sort_order, notes FROM company_categories ORDER BY category_name")
+            if not cats_df.empty:
+                choice_map = {f"{row['category_name']} (ID {row['category_id']})": int(row['category_id']) for _, row in cats_df.iterrows()}
+                selected = st.selectbox("Edit category", list(choice_map.keys()))
+                row = query_one("SELECT * FROM company_categories WHERE category_id = %s", (choice_map[selected],))
+                with st.form("edit_category_form"):
+                    new_name = st.text_input("Category name", value=row['category_name'])
+                    new_active = st.checkbox("Active", value=bool(row['active']))
+                    new_sort = st.number_input("Sort order ", min_value=0, step=1, value=int(row['sort_order'] or 0))
+                    new_notes = st.text_area("Notes ", value=row['notes'] or "")
+                    c1, c2 = st.columns(2)
+                    save = c1.form_submit_button("Save Category")
+                    delete = c2.form_submit_button("Delete Category")
+                    if save:
+                        try:
+                            execute(
+                                "UPDATE company_categories SET category_name = %s, active = %s, sort_order = %s, notes = %s WHERE category_id = %s",
+                                (new_name.strip(), 1 if new_active else 0, new_sort, new_notes.strip(), row['category_id']),
+                            )
+                            st.success("Category updated.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not update category: {exc}")
+                    if delete:
+                        try:
+                            execute("DELETE FROM company_categories WHERE category_id = %s", (row['category_id'],))
+                            st.success("Category deleted.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error("Could not delete category. Remove dependent records first or mark it inactive.")
+            st.dataframe(cats_df, use_container_width=True)
 
     with tab2:
         cats = query_df("SELECT category_id, category_name FROM company_categories WHERE active = 1 ORDER BY category_name")
         if cats.empty:
             st.info("Add a category first.")
         else:
-            cat_map = {str(name): int(cat_id) for name, cat_id in zip(cats["category_name"], cats["category_id"])}
-            with st.form("add_subcategory_form"):
-                selected_cat = st.selectbox("Category", list(cat_map.keys()))
-                subcategory_name = st.text_input("Sub-category name")
-                sort_order = st.number_input("Sort order ", min_value=0, step=1, value=0, key="sub_sort")
-                notes = st.text_area("Notes ")
-                submitted = st.form_submit_button("Add sub-category")
-                if submitted and subcategory_name.strip():
-                    execute(
-                        """
-                        INSERT INTO company_subcategories (category_id, subcategory_name, sort_order, notes)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (category_id, subcategory_name) DO NOTHING
-                        """,
-                        (cat_map[selected_cat], subcategory_name.strip(), sort_order, notes.strip()),
-                    )
-                    st.success("Sub-category added.")
-
-        st.dataframe(
-            query_df(
-                """
-                SELECT s.subcategory_id, c.category_name, s.subcategory_name, s.active, s.sort_order, s.notes
-                FROM company_subcategories s
-                JOIN company_categories c ON s.category_id = c.category_id
-                ORDER BY c.category_name, s.subcategory_name
-                """
-            ),
-            use_container_width=True,
-        )
+            cat_map = dict(zip(cats["category_name"], cats["category_id"]))
+            left, right = st.columns([1, 1])
+            with left:
+                with st.form("add_subcategory_form"):
+                    selected_cat = st.selectbox("Category", list(cat_map.keys()))
+                    subcategory_name = st.text_input("Sub-category name")
+                    sort_order = st.number_input("Sort order", min_value=0, step=1, value=0, key="sub_sort")
+                    notes = st.text_area("Notes", key="sub_notes")
+                    submitted = st.form_submit_button("Add Sub-category")
+                    if submitted:
+                        if not subcategory_name.strip():
+                            st.error("Sub-category name is required.")
+                        else:
+                            try:
+                                execute(
+                                    "INSERT INTO company_subcategories (category_id, subcategory_name, sort_order, notes) VALUES (%s, %s, %s, %s)",
+                                    (cat_map[selected_cat], subcategory_name.strip(), sort_order, notes.strip()),
+                                )
+                                st.success("Sub-category added.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Could not add sub-category: {exc}")
+            with right:
+                subs_df = query_df(
+                    """
+                    SELECT s.subcategory_id, c.category_name, s.subcategory_name, s.active, s.sort_order, s.notes
+                    FROM company_subcategories s
+                    JOIN company_categories c ON s.category_id = c.category_id
+                    ORDER BY c.category_name, s.subcategory_name
+                    """
+                )
+                if not subs_df.empty:
+                    sub_choice = {
+                        f"{row['category_name']} | {row['subcategory_name']} (ID {row['subcategory_id']})": int(row['subcategory_id'])
+                        for _, row in subs_df.iterrows()
+                    }
+                    selected_sub = st.selectbox("Edit sub-category", list(sub_choice.keys()))
+                    sub_row = query_one("SELECT * FROM company_subcategories WHERE subcategory_id = %s", (sub_choice[selected_sub],))
+                    cats_all = query_df("SELECT category_id, category_name FROM company_categories WHERE active = 1 ORDER BY category_name")
+                    cats_all_map = dict(zip(cats_all['category_name'], cats_all['category_id']))
+                    current_cat_name = next((n for n, cid in cats_all_map.items() if cid == sub_row['category_id']), list(cats_all_map.keys())[0])
+                    with st.form("edit_subcategory_form"):
+                        new_cat = st.selectbox("Category", list(cats_all_map.keys()), index=list(cats_all_map.keys()).index(current_cat_name))
+                        new_name = st.text_input("Sub-category name", value=sub_row['subcategory_name'])
+                        new_active = st.checkbox("Active", value=bool(sub_row['active']))
+                        new_sort = st.number_input("Sort order ", min_value=0, step=1, value=int(sub_row['sort_order'] or 0), key='edit_sub_sort')
+                        new_notes = st.text_area("Notes ", value=sub_row['notes'] or "")
+                        c1, c2 = st.columns(2)
+                        save = c1.form_submit_button("Save Sub-category")
+                        delete = c2.form_submit_button("Delete Sub-category")
+                        if save:
+                            try:
+                                execute(
+                                    "UPDATE company_subcategories SET category_id = %s, subcategory_name = %s, active = %s, sort_order = %s, notes = %s WHERE subcategory_id = %s",
+                                    (cats_all_map[new_cat], new_name.strip(), 1 if new_active else 0, new_sort, new_notes.strip(), sub_row['subcategory_id']),
+                                )
+                                st.success("Sub-category updated.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Could not update sub-category: {exc}")
+                        if delete:
+                            try:
+                                execute("DELETE FROM company_subcategories WHERE subcategory_id = %s", (sub_row['subcategory_id'],))
+                                st.success("Sub-category deleted.")
+                                st.rerun()
+                            except Exception:
+                                st.error("Could not delete sub-category. Remove dependent materials first or mark it inactive.")
+                st.dataframe(subs_df, use_container_width=True)
 
     with tab3:
+        st.info("Units remain editable here for Owner or manager use.")
         with st.form("add_unit_form"):
             c1, c2, c3, c4 = st.columns(4)
             unit_name = c1.text_input("Unit name")
@@ -720,19 +984,19 @@ def page_setup() -> None:
             measurement_system = c3.text_input("Measurement system")
             unit_type = c4.text_input("Unit type")
             notes = st.text_area("Notes", key="unit_notes")
-            submitted = st.form_submit_button("Add unit")
+            submitted = st.form_submit_button("Add Unit")
             if submitted and unit_name.strip():
-                execute(
-                    """
-                    INSERT INTO units_of_measure (unit_name, unit_abbreviation, measurement_system, unit_type, notes)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (unit_name) DO NOTHING
-                    """,
-                    (unit_name.strip(), unit_abbreviation.strip(), measurement_system.strip(), unit_type.strip(), notes.strip()),
-                )
-                st.success("Unit added.")
-
-        st.dataframe(query_df("SELECT * FROM units_of_measure ORDER BY unit_name"), use_container_width=True)
+                try:
+                    execute(
+                        "INSERT INTO units_of_measure (unit_name, unit_abbreviation, measurement_system, unit_type, notes) VALUES (%s, %s, %s, %s, %s)",
+                        (unit_name.strip(), unit_abbreviation.strip(), measurement_system.strip(), unit_type.strip(), notes.strip()),
+                    )
+                    st.success("Unit added.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not add unit: {exc}")
+        units_df = query_df("SELECT * FROM units_of_measure ORDER BY unit_name")
+        st.dataframe(units_df, use_container_width=True)
 
 
 def page_materials() -> None:
@@ -917,15 +1181,17 @@ def page_materials() -> None:
             ), use_container_width=True)
 
             col1, col2 = st.columns(2)
+            vendor_pdf = build_vendor_master_pdf(selected_vendor)
             col1.download_button(
                 "Download Vendor Master PDF",
-                data=build_vendor_master_pdf(selected_vendor).getvalue(),
+                data=vendor_pdf.getvalue(),
                 file_name=f"vendor_master_{selected_vendor.replace(' ', '_')}.pdf",
                 mime="application/pdf",
             )
+            vendor_xlsx = build_vendor_master_excel(selected_vendor)
             col2.download_button(
                 "Download Vendor Master Excel",
-                data=build_vendor_master_excel(selected_vendor).getvalue(),
+                data=vendor_xlsx.getvalue(),
                 file_name=f"vendor_master_{selected_vendor.replace(' ', '_')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
@@ -1257,26 +1523,42 @@ def page_projects() -> None:
 # -----------------------------
 
 def main() -> None:
-    st.set_page_config(page_title="Materials Management V1 - Neon Cloud", layout="wide")
+    st.set_page_config(page_title="Materials Management V2 - Neon Cloud", layout="wide")
     init_db()
 
-    st.title("Materials Management V1 - Neon Cloud")
+    if not require_login():
+        return
+
+    current_user = st.session_state.get("user", {})
+
+    st.title("Materials Management V2 - Neon Cloud")
     st.caption("Master materials database + project materials quoting")
+
+    pages = ["Dashboard", "Categories", "Materials", "Projects"]
+    if can_manage_users():
+        pages.append("Admin")
 
     with st.sidebar:
         st.markdown("### Navigation")
-        page = st.radio("Go to", ["Dashboard", "Setup", "Materials", "Projects"])
+        page = st.radio("Go to", pages)
         st.markdown("---")
         st.success("Connected to Cloud Database ✅")
+        st.markdown("---")
+        st.write(f"**User:** {current_user.get('username', '')}")
+        st.write(f"**Type:** {current_user.get('role', '')}")
+        if st.button("Log Out"):
+            logout()
 
     if page == "Dashboard":
         page_dashboard()
-    elif page == "Setup":
-        page_setup()
+    elif page == "Categories":
+        page_categories()
     elif page == "Materials":
         page_materials()
     elif page == "Projects":
         page_projects()
+    elif page == "Admin":
+        page_admin()
 
 
 if __name__ == "__main__":
