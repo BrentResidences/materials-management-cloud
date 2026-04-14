@@ -496,9 +496,9 @@ def page_admin() -> None:
         st.warning("Only the Owner can access this page.")
         return
 
-    tab1, tab2 = st.tabs(["Create User", "Manage Users"])
+    admin_section = st.radio("Admin Section", ["Create User", "Manage Users"], horizontal=True, key="admin_section")
 
-    with tab1:
+    if admin_section == "Create User":
         with st.form("create_user_form"):
             c1, c2 = st.columns(2)
             username = c1.text_input("Username")
@@ -523,7 +523,7 @@ def page_admin() -> None:
                     st.success("User created.")
                     st.rerun()
 
-    with tab2:
+    if admin_section == "Manage Users":
         users_df = query_df("SELECT user_id, username, role, active, created_at, updated_at FROM users ORDER BY username")
         users_df = format_dates(users_df)
         st.dataframe(users_df, use_container_width=True)
@@ -899,9 +899,9 @@ def page_dashboard() -> None:
 def page_categories() -> None:
     st.header("Categories")
     lookups = get_lookup_data()
-    tab1, tab2, tab3 = st.tabs(["Categories", "Sub-categories", "Units"])
+    category_section = st.radio("Category Section", ["Categories", "Sub-categories", "Units"], horizontal=True, key="category_section")
 
-    with tab1:
+    if category_section == "Categories":
         left, right = st.columns([1, 1])
         with left:
             with st.form("add_category_form"):
@@ -955,7 +955,7 @@ def page_categories() -> None:
                             st.error("Could not delete category. Remove dependent records first or mark it inactive.")
             st.dataframe(cats_df, use_container_width=True)
 
-    with tab2:
+    if category_section == "Sub-categories":
         cats = lookups["active_categories"].copy()
         if cats.empty:
             st.info("Add a category first.")
@@ -1022,7 +1022,7 @@ def page_categories() -> None:
                                 st.error("Could not delete sub-category. Remove dependent materials first or mark it inactive.")
                 st.dataframe(subs_df, use_container_width=True)
 
-    with tab3:
+    if category_section == "Units":
         st.info("Units remain editable here for Owner or manager use.")
         with st.form("add_unit_form"):
             c1, c2, c3, c4 = st.columns(4)
@@ -1049,9 +1049,9 @@ def page_categories() -> None:
 def page_materials() -> None:
     st.header("Materials")
     lookups = get_lookup_data()
-    tab1, tab2, tab3, tab4 = st.tabs(["Add Material", "Add Vendor Info", "Search / Review", "Vendor Master Reports"])
+    materials_section = st.radio("Materials Section", ["Add Material", "Add Vendor Info", "Search / Review", "Vendor Master Reports"], horizontal=True, key="materials_section")
 
-    with tab1:
+    if materials_section == "Add Material":
         cats = lookups["active_categories"].copy()
         units = lookups["active_units"].copy()
         if cats.empty or units.empty:
@@ -1107,7 +1107,7 @@ def page_materials() -> None:
                     )
                     st.success("Material added.")
 
-    with tab2:
+    if materials_section == "Add Vendor Info":
         mats = lookups["active_materials"][["material_id", "material_name"]].copy()
         if mats.empty:
             st.info("Add a material first.")
@@ -1156,7 +1156,7 @@ def page_materials() -> None:
                     )
                     st.success("Vendor info added.")
 
-    with tab3:
+    if materials_section == "Search / Review":
         c1, c2, c3 = st.columns(3)
         search = c1.text_input("Search materials")
         categories = lookups["active_categories"].copy()
@@ -1212,7 +1212,7 @@ def page_materials() -> None:
         df_vendor = format_dates(df_vendor)
         st.dataframe(df_vendor, use_container_width=True)
 
-    with tab4:
+    if materials_section == "Vendor Master Reports":
         st.subheader("Vendor Master Reports")
         vendors_df = query_df(
             "SELECT DISTINCT vendor_name FROM material_vendor_current WHERE active = 1 AND TRIM(COALESCE(vendor_name,'')) <> '' ORDER BY vendor_name"
@@ -1258,14 +1258,14 @@ def page_materials() -> None:
 def page_projects() -> None:
     st.header("Projects")
     lookups = get_lookup_data()
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "Create Project",
-        "Add Work Item",
-        "Add Materials to Work Item",
-        "Project Detail / Reports",
-    ])
+    project_section = st.radio(
+        "Project Section",
+        ["Create Project", "Add Work Item", "Add Materials to Work Item", "Project Detail / Reports"],
+        horizontal=True,
+        key="project_section",
+    )
 
-    with tab1:
+    if project_section == "Create Project":
         with st.form("create_project_form"):
             project_name = st.text_input("Project name")
             c1, c2 = st.columns(2)
@@ -1294,7 +1294,7 @@ def page_projects() -> None:
                 )
                 st.success("Project created.")
 
-    with tab2:
+    if project_section == "Add Work Item":
         projects = lookups["projects"].copy()
         if projects.empty:
             st.info("Create a project first.")
@@ -1317,7 +1317,7 @@ def page_projects() -> None:
                     )
                     st.success("Work Item added.")
 
-    with tab3:
+    if project_section == "Add Materials to Work Item":
         work_items = query_df(
             """
             SELECT wi.work_item_id, p.project_name || ' | ' || wi.work_item_name AS label
@@ -1387,7 +1387,7 @@ def page_projects() -> None:
                     )
                     st.success("Material line added.")
 
-    with tab4:
+    if project_section == "Project Detail / Reports":
         projects = lookups["projects"].copy()
         if projects.empty:
             st.info("No projects yet.")
