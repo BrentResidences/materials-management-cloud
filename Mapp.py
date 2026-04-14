@@ -53,25 +53,31 @@ def _normalize_params(params: tuple | list | None = ()) -> tuple:
 
 def execute(sql: str, params: tuple = ()) -> None:
     params = _normalize_params(params)
-    with closing(get_conn()) as conn:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute(sql, params)
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     cached_query_df.clear()
     cached_query_one.clear()
+    get_lookup_data.clear()
+    get_dashboard_data.clear()
 
 
 @st.cache_data(ttl=120, show_spinner=False)
 def cached_query_df(sql: str, params: tuple = ()) -> pd.DataFrame:
     params = _normalize_params(params)
-    with closing(get_conn()) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-            columns = [desc.name if hasattr(desc, "name") else desc[0] for desc in (cur.description or [])]
-            if not rows:
-                return pd.DataFrame(columns=columns)
-            return pd.DataFrame(rows, columns=columns)
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        columns = [desc.name if hasattr(desc, "name") else desc[0] for desc in (cur.description or [])]
+        if not rows:
+            return pd.DataFrame(columns=columns)
+        return pd.DataFrame(rows, columns=columns)
 
 
 def query_df(sql: str, params: tuple = ()) -> pd.DataFrame:
@@ -81,20 +87,14 @@ def query_df(sql: str, params: tuple = ()) -> pd.DataFrame:
 @st.cache_data(ttl=120, show_spinner=False)
 def cached_query_one(sql: str, params: tuple = ()) -> Optional[dict[str, Any]]:
     params = _normalize_params(params)
-    with closing(get_conn()) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            return cur.fetchone()
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchone()
 
 
 def query_one(sql: str, params: tuple = ()) -> Optional[dict[str, Any]]:
     return cached_query_one(sql, _normalize_params(params))
-
-
-@st.cache_resource(show_spinner=False)
-def bootstrap_db() -> bool:
-    bootstrap_db()
-    return True
 
 
 def init_db() -> None:
@@ -280,6 +280,64 @@ def seed_defaults() -> None:
                     row,
                 )
         conn.commit()
+
+
+@st.cache_resource(show_spinner=False)
+def ensure_db_ready() -> bool:
+    ensure_db_ready()
+    return True
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_lookup_data() -> dict[str, pd.DataFrame]:
+    return {
+        "categories": query_df("SELECT category_id, category_name, active, sort_order, notes FROM company_categories ORDER BY category_name"),
+        "subcategories": query_df(
+            """
+            SELECT s.subcategory_id, s.category_id, c.category_name, s.subcategory_name, s.active, s.sort_order, s.notes
+            FROM company_subcategories s
+            JOIN company_categories c ON s.category_id = c.category_id
+            ORDER BY c.category_name, s.subcategory_name
+            """
+        ),
+        "units": query_df("SELECT * FROM units_of_measure ORDER BY unit_name"),
+        "active_units": query_df("SELECT unit_id, unit_name FROM units_of_measure WHERE active = 1 ORDER BY unit_name"),
+        "active_categories": query_df("SELECT category_id, category_name FROM company_categories WHERE active = 1 ORDER BY category_name"),
+        "active_materials": query_df(
+            """
+            SELECT m.material_id, m.material_name, u.unit_id AS default_unit_id
+            FROM materials m
+            LEFT JOIN units_of_measure u ON m.default_unit_id = u.unit_id
+            WHERE m.active = 1
+            ORDER BY m.material_name
+            """
+        ),
+        "projects": query_df("SELECT project_id, project_name FROM projects ORDER BY project_name"),
+    }
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_dashboard_data() -> dict[str, Any]:
+    counts = query_one(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM company_categories WHERE active = 1) AS categories,
+            (SELECT COUNT(*) FROM materials WHERE active = 1) AS materials,
+            (SELECT COUNT(*) FROM projects) AS projects,
+            (SELECT COUNT(*) FROM project_work_items) AS work_items
+        """
+    ) or {"categories": 0, "materials": 0, "projects": 0, "work_items": 0}
+    recent_materials = format_dates(query_df(
+        "SELECT material_id, material_name, manufacturer, model_number, dimension_display, date_created FROM materials ORDER BY material_id DESC LIMIT 10"
+    ))
+    recent_projects = format_dates(query_df(
+        "SELECT project_id, project_name, property_name, unit_or_location, status, date_created FROM projects ORDER BY project_id DESC LIMIT 10"
+    ))
+    return {
+        "counts": counts,
+        "recent_materials": recent_materials,
+        "recent_projects": recent_projects,
+    }
 
 
 # -----------------------------
@@ -822,29 +880,25 @@ def build_vendor_master_excel(selected_vendor: str) -> BytesIO:
 
 def page_dashboard() -> None:
     st.header("Dashboard")
+    data = get_dashboard_data()
+    counts = data["counts"]
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Categories", int(query_one("SELECT COUNT(*) AS c FROM company_categories WHERE active = 1")["c"]))
-    c2.metric("Materials", int(query_one("SELECT COUNT(*) AS c FROM materials WHERE active = 1")["c"]))
-    c3.metric("Projects", int(query_one("SELECT COUNT(*) AS c FROM projects")["c"]))
-    c4.metric("Work Items", int(query_one("SELECT COUNT(*) AS c FROM project_work_items")["c"]))
+    c1.metric("Categories", int(counts["categories"]))
+    c2.metric("Materials", int(counts["materials"]))
+    c3.metric("Projects", int(counts["projects"]))
+    c4.metric("Work Items", int(counts["work_items"]))
 
     st.subheader("Recent Materials")
-    df_mat = query_df(
-        "SELECT material_id, material_name, manufacturer, model_number, dimension_display, date_created FROM materials ORDER BY material_id DESC LIMIT 10"
-    )
-    df_mat = format_dates(df_mat)
-    st.dataframe(df_mat, use_container_width=True)
+    st.dataframe(data["recent_materials"], use_container_width=True)
 
     st.subheader("Recent Projects")
-    df_proj = query_df(
-        "SELECT project_id, project_name, property_name, unit_or_location, status, date_created FROM projects ORDER BY project_id DESC LIMIT 10"
-    )
-    df_proj = format_dates(df_proj)
-    st.dataframe(df_proj, use_container_width=True)
+    st.dataframe(data["recent_projects"], use_container_width=True)
 
 
 def page_categories() -> None:
     st.header("Categories")
+    lookups = get_lookup_data()
     tab1, tab2, tab3 = st.tabs(["Categories", "Sub-categories", "Units"])
 
     with tab1:
@@ -869,7 +923,7 @@ def page_categories() -> None:
                         except Exception as exc:
                             st.error(f"Could not add category: {exc}")
         with right:
-            cats_df = query_df("SELECT category_id, category_name, active, sort_order, notes FROM company_categories ORDER BY category_name")
+            cats_df = lookups["categories"].copy()
             if not cats_df.empty:
                 choice_map = {f"{row['category_name']} (ID {row['category_id']})": int(row['category_id']) for _, row in cats_df.iterrows()}
                 selected = st.selectbox("Edit category", list(choice_map.keys()))
@@ -902,7 +956,7 @@ def page_categories() -> None:
             st.dataframe(cats_df, use_container_width=True)
 
     with tab2:
-        cats = query_df("SELECT category_id, category_name FROM company_categories WHERE active = 1 ORDER BY category_name")
+        cats = lookups["active_categories"].copy()
         if cats.empty:
             st.info("Add a category first.")
         else:
@@ -929,14 +983,7 @@ def page_categories() -> None:
                             except Exception as exc:
                                 st.error(f"Could not add sub-category: {exc}")
             with right:
-                subs_df = query_df(
-                    """
-                    SELECT s.subcategory_id, c.category_name, s.subcategory_name, s.active, s.sort_order, s.notes
-                    FROM company_subcategories s
-                    JOIN company_categories c ON s.category_id = c.category_id
-                    ORDER BY c.category_name, s.subcategory_name
-                    """
-                )
+                subs_df = lookups["subcategories"].copy()
                 if not subs_df.empty:
                     sub_choice = {
                         f"{row['category_name']} | {row['subcategory_name']} (ID {row['subcategory_id']})": int(row['subcategory_id'])
@@ -944,7 +991,7 @@ def page_categories() -> None:
                     }
                     selected_sub = st.selectbox("Edit sub-category", list(sub_choice.keys()))
                     sub_row = query_one("SELECT * FROM company_subcategories WHERE subcategory_id = %s", (sub_choice[selected_sub],))
-                    cats_all = query_df("SELECT category_id, category_name FROM company_categories WHERE active = 1 ORDER BY category_name")
+                    cats_all = lookups["active_categories"].copy()
                     cats_all_map = dict(zip(cats_all['category_name'], cats_all['category_id']))
                     current_cat_name = next((n for n, cid in cats_all_map.items() if cid == sub_row['category_id']), list(cats_all_map.keys())[0])
                     with st.form("edit_subcategory_form"):
@@ -995,17 +1042,18 @@ def page_categories() -> None:
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Could not add unit: {exc}")
-        units_df = query_df("SELECT * FROM units_of_measure ORDER BY unit_name")
+        units_df = lookups["units"].copy()
         st.dataframe(units_df, use_container_width=True)
 
 
 def page_materials() -> None:
     st.header("Materials")
+    lookups = get_lookup_data()
     tab1, tab2, tab3, tab4 = st.tabs(["Add Material", "Add Vendor Info", "Search / Review", "Vendor Master Reports"])
 
     with tab1:
-        cats = query_df("SELECT category_id, category_name FROM company_categories WHERE active = 1 ORDER BY category_name")
-        units = query_df("SELECT unit_id, unit_name FROM units_of_measure WHERE active = 1 ORDER BY unit_name")
+        cats = lookups["active_categories"].copy()
+        units = lookups["active_units"].copy()
         if cats.empty or units.empty:
             st.warning("Please add categories and units first.")
         else:
@@ -1060,7 +1108,7 @@ def page_materials() -> None:
                     st.success("Material added.")
 
     with tab2:
-        mats = query_df("SELECT material_id, material_name FROM materials WHERE active = 1 ORDER BY material_name")
+        mats = lookups["active_materials"][["material_id", "material_name"]].copy()
         if mats.empty:
             st.info("Add a material first.")
         else:
@@ -1111,7 +1159,7 @@ def page_materials() -> None:
     with tab3:
         c1, c2, c3 = st.columns(3)
         search = c1.text_input("Search materials")
-        categories = query_df("SELECT category_id, category_name FROM company_categories WHERE active = 1 ORDER BY category_name")
+        categories = lookups["active_categories"].copy()
         category_options = ["All"] + categories["category_name"].tolist()
         selected_category = c2.selectbox("Category filter", category_options)
 
@@ -1181,24 +1229,35 @@ def page_materials() -> None:
             ), use_container_width=True)
 
             col1, col2 = st.columns(2)
-            vendor_pdf = build_vendor_master_pdf(selected_vendor)
-            col1.download_button(
-                "Download Vendor Master PDF",
-                data=vendor_pdf.getvalue(),
-                file_name=f"vendor_master_{selected_vendor.replace(' ', '_')}.pdf",
-                mime="application/pdf",
-            )
-            vendor_xlsx = build_vendor_master_excel(selected_vendor)
-            col2.download_button(
-                "Download Vendor Master Excel",
-                data=vendor_xlsx.getvalue(),
-                file_name=f"vendor_master_{selected_vendor.replace(' ', '_')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            vendor_pdf_key = f"vendor_master_pdf_bytes_{selected_vendor}"
+            vendor_xlsx_key = f"vendor_master_xlsx_bytes_{selected_vendor}"
+
+            if col1.button("Prepare Vendor Master PDF", key=f"prep_vendor_master_pdf_{selected_vendor}"):
+                st.session_state[vendor_pdf_key] = build_vendor_master_pdf(selected_vendor).getvalue()
+            if vendor_pdf_key in st.session_state:
+                col1.download_button(
+                    "Download Vendor Master PDF",
+                    data=st.session_state[vendor_pdf_key],
+                    file_name=f"vendor_master_{selected_vendor.replace(' ', '_')}.pdf",
+                    mime="application/pdf",
+                    key=f"download_vendor_master_pdf_{selected_vendor}",
+                )
+
+            if col2.button("Prepare Vendor Master Excel", key=f"prep_vendor_master_xlsx_{selected_vendor}"):
+                st.session_state[vendor_xlsx_key] = build_vendor_master_excel(selected_vendor).getvalue()
+            if vendor_xlsx_key in st.session_state:
+                col2.download_button(
+                    "Download Vendor Master Excel",
+                    data=st.session_state[vendor_xlsx_key],
+                    file_name=f"vendor_master_{selected_vendor.replace(' ', '_')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"download_vendor_master_xlsx_{selected_vendor}",
+                )
 
 
 def page_projects() -> None:
     st.header("Projects")
+    lookups = get_lookup_data()
     tab1, tab2, tab3, tab4 = st.tabs([
         "Create Project",
         "Add Work Item",
@@ -1236,7 +1295,7 @@ def page_projects() -> None:
                 st.success("Project created.")
 
     with tab2:
-        projects = query_df("SELECT project_id, project_name FROM projects ORDER BY project_name")
+        projects = lookups["projects"].copy()
         if projects.empty:
             st.info("Create a project first.")
         else:
@@ -1267,16 +1326,8 @@ def page_projects() -> None:
             ORDER BY p.project_name, wi.sort_order NULLS LAST, wi.work_item_name
             """
         )
-        materials = query_df(
-            """
-            SELECT m.material_id, m.material_name, u.unit_id AS default_unit_id
-            FROM materials m
-            LEFT JOIN units_of_measure u ON m.default_unit_id = u.unit_id
-            WHERE m.active = 1
-            ORDER BY m.material_name
-            """
-        )
-        units = query_df("SELECT unit_id, unit_name FROM units_of_measure WHERE active = 1 ORDER BY unit_name")
+        materials = lookups["active_materials"].copy()
+        units = lookups["active_units"].copy()
         if work_items.empty or materials.empty or units.empty:
             st.info("You need at least one project, work item, material, and unit.")
         else:
@@ -1337,7 +1388,7 @@ def page_projects() -> None:
                     st.success("Material line added.")
 
     with tab4:
-        projects = query_df("SELECT project_id, project_name FROM projects ORDER BY project_name")
+        projects = lookups["projects"].copy()
         if projects.empty:
             st.info("No projects yet.")
             return
@@ -1493,29 +1544,42 @@ def page_projects() -> None:
             st.dataframe(category_rollup, use_container_width=True)
 
             col_pdf1, col_pdf2, col_xlsx = st.columns(3)
-            project_pdf = build_project_report_pdf(project_id)
-            col_pdf1.download_button(
-                "Download Project PDF",
-                data=project_pdf.getvalue(),
-                file_name=f"project_report_{project_id}.pdf",
-                mime="application/pdf",
-            )
+            project_pdf_key = f"project_pdf_bytes_{project_id}"
+            vendor_pdf_key = f"project_vendor_pdf_bytes_{project_id}"
+            vendor_xlsx_key = f"project_vendor_xlsx_bytes_{project_id}"
 
-            vendor_pdf = build_vendor_report_pdf(project_id)
-            col_pdf2.download_button(
-                "Download Vendor PDF",
-                data=vendor_pdf.getvalue(),
-                file_name=f"vendor_report_{project_id}.pdf",
-                mime="application/pdf",
-            )
+            if col_pdf1.button("Prepare Project PDF", key=f"prep_project_pdf_{project_id}"):
+                st.session_state[project_pdf_key] = build_project_report_pdf(project_id).getvalue()
+            if project_pdf_key in st.session_state:
+                col_pdf1.download_button(
+                    "Download Project PDF",
+                    data=st.session_state[project_pdf_key],
+                    file_name=f"project_report_{project_id}.pdf",
+                    mime="application/pdf",
+                    key=f"download_project_pdf_{project_id}",
+                )
 
-            vendor_xlsx = build_vendor_report_excel(project_id)
-            col_xlsx.download_button(
-                "Download Vendor Excel",
-                data=vendor_xlsx.getvalue(),
-                file_name=f"vendor_report_{project_id}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            if col_pdf2.button("Prepare Vendor PDF", key=f"prep_vendor_pdf_{project_id}"):
+                st.session_state[vendor_pdf_key] = build_vendor_report_pdf(project_id).getvalue()
+            if vendor_pdf_key in st.session_state:
+                col_pdf2.download_button(
+                    "Download Vendor PDF",
+                    data=st.session_state[vendor_pdf_key],
+                    file_name=f"vendor_report_{project_id}.pdf",
+                    mime="application/pdf",
+                    key=f"download_vendor_pdf_{project_id}",
+                )
+
+            if col_xlsx.button("Prepare Vendor Excel", key=f"prep_vendor_xlsx_{project_id}"):
+                st.session_state[vendor_xlsx_key] = build_vendor_report_excel(project_id).getvalue()
+            if vendor_xlsx_key in st.session_state:
+                col_xlsx.download_button(
+                    "Download Vendor Excel",
+                    data=st.session_state[vendor_xlsx_key],
+                    file_name=f"vendor_report_{project_id}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"download_vendor_xlsx_{project_id}",
+                )
 
 
 # -----------------------------
