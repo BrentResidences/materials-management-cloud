@@ -24,17 +24,36 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 # Database helpers
 # -----------------------------
 
+def _connect_new() -> psycopg.Connection:
+    return psycopg.connect(
+        host=st.secrets["connections"]["postgresql"]["host"],
+        dbname=st.secrets["connections"]["postgresql"]["database"],
+        user=st.secrets["connections"]["postgresql"]["username"],
+        password=st.secrets["connections"]["postgresql"]["password"],
+        port=st.secrets["connections"]["postgresql"]["port"],
+        sslmode=st.secrets["connections"]["postgresql"].get("sslmode", "require"),
+        row_factory=dict_row,
+        autocommit=False,
+    )
+
+
 def get_conn() -> psycopg.Connection:
     try:
-        conn = psycopg.connect(
-            host=st.secrets["connections"]["postgresql"]["host"],
-            dbname=st.secrets["connections"]["postgresql"]["database"],
-            user=st.secrets["connections"]["postgresql"]["username"],
-            password=st.secrets["connections"]["postgresql"]["password"],
-            port=st.secrets["connections"]["postgresql"]["port"],
-            sslmode=st.secrets["connections"]["postgresql"].get("sslmode", "require"),
-            row_factory=dict_row,
-        )
+        conn = st.session_state.get("_db_conn")
+        if conn is None or getattr(conn, "closed", False):
+            conn = _connect_new()
+            st.session_state["_db_conn"] = conn
+        else:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = _connect_new()
+                st.session_state["_db_conn"] = conn
         return conn
     except Exception as exc:
         st.error("Could not connect to Neon / PostgreSQL. Check your Streamlit secrets.")
@@ -221,10 +240,14 @@ def init_db() -> None:
     CREATE INDEX IF NOT EXISTS idx_work_item_materials_work_item ON work_item_materials(work_item_id);
     CREATE INDEX IF NOT EXISTS idx_projects_name ON projects(project_name);
     """
-    with closing(get_conn()) as conn:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute(ddl)
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     seed_defaults()
 
 
@@ -262,7 +285,8 @@ def seed_defaults() -> None:
         ("Liter", "L", "Metric", "Volume"),
         ("Kilogram", "KG", "Metric", "Weight"),
     ]
-    with closing(get_conn()) as conn:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             for name in categories:
                 cur.execute(
@@ -280,6 +304,9 @@ def seed_defaults() -> None:
                     row,
                 )
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 @st.cache_resource(show_spinner=False)
@@ -420,6 +447,12 @@ def ensure_session_defaults() -> None:
 
 
 def logout() -> None:
+    conn = st.session_state.pop("_db_conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
     st.session_state["logged_in"] = False
     st.session_state["user"] = None
     st.rerun()
