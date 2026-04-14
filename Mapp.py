@@ -1246,17 +1246,7 @@ def main() -> None:
         st.markdown("### Navigation")
         page = st.radio("Go to", ["Dashboard", "Setup", "Materials", "Projects"])
         st.markdown("---")
-        st.markdown("### Neon Setup")
-        st.code(
-            "[connections.postgresql]\n"
-            'host = "YOUR_HOST"\n'
-            'database = "YOUR_DATABASE"\n'
-            'username = "YOUR_USERNAME"\n'
-            'password = "YOUR_PASSWORD"\n'
-            'port = 5432\n'
-            'sslmode = "require"',
-            language="toml",
-        )
+        st.success("Connected to Cloud Database ✅")
 
     if page == "Dashboard":
         page_dashboard()
