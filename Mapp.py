@@ -41,14 +41,29 @@ def get_conn() -> psycopg.Connection:
         raise exc
 
 
+def _normalize_params(params: tuple | list | None = ()) -> tuple:
+    if params is None:
+        return ()
+    if isinstance(params, tuple):
+        return params
+    if isinstance(params, list):
+        return tuple(params)
+    return (params,)
+
+
 def execute(sql: str, params: tuple = ()) -> None:
+    params = _normalize_params(params)
     with closing(get_conn()) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
         conn.commit()
+    cached_query_df.clear()
+    cached_query_one.clear()
 
 
-def query_df(sql: str, params: tuple = ()) -> pd.DataFrame:
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_query_df(sql: str, params: tuple = ()) -> pd.DataFrame:
+    params = _normalize_params(params)
     with closing(get_conn()) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
@@ -59,11 +74,27 @@ def query_df(sql: str, params: tuple = ()) -> pd.DataFrame:
             return pd.DataFrame(rows, columns=columns)
 
 
-def query_one(sql: str, params: tuple = ()) -> Optional[dict[str, Any]]:
+def query_df(sql: str, params: tuple = ()) -> pd.DataFrame:
+    return cached_query_df(sql, _normalize_params(params)).copy()
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_query_one(sql: str, params: tuple = ()) -> Optional[dict[str, Any]]:
+    params = _normalize_params(params)
     with closing(get_conn()) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             return cur.fetchone()
+
+
+def query_one(sql: str, params: tuple = ()) -> Optional[dict[str, Any]]:
+    return cached_query_one(sql, _normalize_params(params))
+
+
+@st.cache_resource(show_spinner=False)
+def bootstrap_db() -> bool:
+    bootstrap_db()
+    return True
 
 
 def init_db() -> None:
